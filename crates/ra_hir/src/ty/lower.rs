@@ -9,17 +9,18 @@ use std::sync::Arc;
 use std::iter;
 
 use crate::{
-    Function, Struct, StructField, Enum, EnumVariant, Path,
-    ModuleDef, TypeAlias,
-    Const, Static,
-    HirDatabase,
+    Function, Struct, Union, StructField, Enum, EnumVariant, Path, ModuleDef, TypeAlias, Const,
+    Static, HirDatabase,
     type_ref::TypeRef,
     name::KnownName,
     nameres::Namespace,
     resolve::{Resolver, Resolution},
     path::{PathSegment, GenericArg},
     generics::{HasGenericParams},
-    adt::VariantDef, Trait, generics::{ WherePredicate, GenericDef}
+    adt::VariantDef,
+    Trait,
+    generics::{WherePredicate, GenericDef},
+    ty::AdtDef,
 };
 use super::{Ty, primitive, FnSig, Substs, TypeCtor, TraitRef, GenericPredicate};
 
@@ -123,6 +124,7 @@ impl Ty {
         let def_generic: Option<GenericDef> = match resolved {
             TypableDef::Function(func) => Some(func.into()),
             TypableDef::Struct(s) => Some(s.into()),
+            TypableDef::Union(u) => Some(u.into()),
             TypableDef::Enum(e) => Some(e.into()),
             TypableDef::EnumVariant(var) => Some(var.parent_enum(db).into()),
             TypableDef::TypeAlias(t) => Some(t.into()),
@@ -143,6 +145,7 @@ impl Ty {
         let segment = match resolved {
             TypableDef::Function(_)
             | TypableDef::Struct(_)
+            | TypableDef::Union(_)
             | TypableDef::Enum(_)
             | TypableDef::Const(_)
             | TypableDef::Static(_)
@@ -288,9 +291,10 @@ impl TraitRef {
 pub(crate) fn type_for_def(db: &impl HirDatabase, def: TypableDef, ns: Namespace) -> Ty {
     match (def, ns) {
         (TypableDef::Function(f), Namespace::Values) => type_for_fn(db, f),
-        (TypableDef::Struct(s), Namespace::Types) => type_for_struct(db, s),
+        (TypableDef::Struct(s), Namespace::Types) => type_for_adt(db, s),
         (TypableDef::Struct(s), Namespace::Values) => type_for_struct_constructor(db, s),
-        (TypableDef::Enum(e), Namespace::Types) => type_for_enum(db, e),
+        (TypableDef::Union(u), Namespace::Types) => type_for_adt(db, u),
+        (TypableDef::Enum(e), Namespace::Types) => type_for_adt(db, e),
         (TypableDef::EnumVariant(v), Namespace::Values) => type_for_enum_variant_constructor(db, v),
         (TypableDef::TypeAlias(t), Namespace::Types) => type_for_type_alias(db, t),
         (TypableDef::Const(c), Namespace::Values) => type_for_const(db, c),
@@ -298,6 +302,7 @@ pub(crate) fn type_for_def(db: &impl HirDatabase, def: TypableDef, ns: Namespace
 
         // 'error' cases:
         (TypableDef::Function(_), Namespace::Types) => Ty::Unknown,
+        (TypableDef::Union(_), Namespace::Values) => Ty::Unknown,
         (TypableDef::Enum(_), Namespace::Values) => Ty::Unknown,
         (TypableDef::EnumVariant(_), Namespace::Types) => Ty::Unknown,
         (TypableDef::TypeAlias(_), Namespace::Values) => Ty::Unknown,
@@ -405,7 +410,7 @@ fn fn_sig_for_struct_constructor(db: &impl HirDatabase, def: Struct) -> FnSig {
         .iter()
         .map(|(_, field)| Ty::from_hir(db, &resolver, &field.type_ref))
         .collect::<Vec<_>>();
-    let ret = type_for_struct(db, def);
+    let ret = type_for_adt(db, def);
     FnSig::from_params_and_return(params, ret)
 }
 
@@ -413,7 +418,7 @@ fn fn_sig_for_struct_constructor(db: &impl HirDatabase, def: Struct) -> FnSig {
 fn type_for_struct_constructor(db: &impl HirDatabase, def: Struct) -> Ty {
     let var_data = def.variant_data(db);
     if var_data.fields().is_none() {
-        return type_for_struct(db, def); // Unit struct
+        return type_for_adt(db, def); // Unit struct
     }
     let generics = def.generic_params(db);
     let substs = Substs::identity(&generics);
@@ -448,9 +453,9 @@ fn type_for_enum_variant_constructor(db: &impl HirDatabase, def: EnumVariant) ->
     Ty::apply(TypeCtor::FnDef(def.into()), substs)
 }
 
-fn type_for_struct(db: &impl HirDatabase, s: Struct) -> Ty {
-    let generics = s.generic_params(db);
-    Ty::apply(TypeCtor::Adt(s.into()), Substs::identity(&generics))
+fn type_for_adt<T: Into<AdtDef> + HasGenericParams>(db: &impl HirDatabase, adt: T) -> Ty {
+    let generics = adt.generic_params(db);
+    Ty::apply(TypeCtor::Adt(adt.into()), Substs::identity(&generics))
 }
 
 fn type_for_enum(db: &impl HirDatabase, s: Enum) -> Ty {
@@ -471,19 +476,21 @@ fn type_for_type_alias(db: &impl HirDatabase, t: TypeAlias) -> Ty {
 pub enum TypableDef {
     Function(Function),
     Struct(Struct),
+    Union(Union),
     Enum(Enum),
     EnumVariant(EnumVariant),
     TypeAlias(TypeAlias),
     Const(Const),
     Static(Static),
 }
-impl_froms!(TypableDef: Function, Struct, Enum, EnumVariant, TypeAlias, Const, Static);
+impl_froms!(TypableDef: Function, Struct, Union, Enum, EnumVariant, TypeAlias, Const, Static);
 
 impl From<ModuleDef> for Option<TypableDef> {
     fn from(def: ModuleDef) -> Option<TypableDef> {
         let res = match def {
             ModuleDef::Function(f) => f.into(),
             ModuleDef::Struct(s) => s.into(),
+            ModuleDef::Union(u) => u.into(),
             ModuleDef::Enum(e) => e.into(),
             ModuleDef::EnumVariant(v) => v.into(),
             ModuleDef::TypeAlias(t) => t.into(),
