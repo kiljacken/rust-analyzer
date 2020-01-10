@@ -45,6 +45,10 @@ pub struct CheckWatcher {
 
 impl CheckWatcher {
     pub fn new(options: &CheckOptions, workspace_root: PathBuf) -> CheckWatcher {
+        eprintln!(
+            "[CheckWatcher] Creating new, workspace_root = {:?}, options = {:#?}",
+            workspace_root, options
+        );
         let options = options.clone();
         let shared = Arc::new(RwLock::new(CheckWatcherSharedState::new()));
 
@@ -60,6 +64,7 @@ impl CheckWatcher {
 
     /// Schedule a re-start of the cargo check worker.
     pub fn update(&self) {
+        eprintln!("[CheckWatcher] Recieved update request, sending to thread");
         if let Some(cmd_send) = &self.cmd_send {
             cmd_send.send(CheckCommand::Update).unwrap();
         }
@@ -99,11 +104,15 @@ impl CheckWatcherSharedState {
     /// Clear the cached diagnostics, and schedule updating diagnostics by the
     /// server, to clear stale results.
     pub fn clear(&mut self, task_send: &Sender<CheckTask>) {
+        eprintln!("[CheckWatcherSharedState] Clearing cached diagnostics");
         let cleared_files: Vec<Url> = self.diagnostic_collection.keys().cloned().collect();
 
         self.diagnostic_collection.clear();
         self.suggested_fix_collection.clear();
 
+        eprintln!(
+            "[CheckWatcherSharedState] Requesting update of files containing cleared diagnostics"
+        );
         for uri in cleared_files {
             task_send.send(CheckTask::Update(uri.clone())).unwrap();
         }
@@ -183,6 +192,7 @@ impl CheckWatcherState {
     }
 
     fn run(&mut self, task_send: &Sender<CheckTask>, cmd_recv: &Receiver<CheckCommand>) {
+        eprintln!("[CheckWatcherState] Starting main loop...");
         loop {
             select! {
                 recv(&cmd_recv) -> cmd => match cmd {
@@ -203,6 +213,7 @@ impl CheckWatcherState {
             };
 
             if self.should_recheck() {
+                eprintln!("[CheckWatcherState] Recieved update request, clearing diagnostics, restarting watch thread");
                 self.last_update_req.take();
                 self.shared.write().clear(task_send);
 
@@ -224,6 +235,9 @@ impl CheckWatcherState {
     }
 
     fn handle_command(&mut self, cmd: CheckCommand) {
+        eprintln!(
+            "[CheckWatcherState] Recieved update command, updating last_update_req timestamp"
+        );
         match cmd {
             CheckCommand::Update => self.last_update_req = Some(Instant::now()),
         }
@@ -232,6 +246,9 @@ impl CheckWatcherState {
     fn handle_message(&mut self, msg: CheckEvent, task_send: &Sender<CheckTask>) {
         match msg {
             CheckEvent::Begin => {
+                eprintln!(
+                    "[CheckWatcherState] Recieved begin event, sending progress begin notification"
+                );
                 task_send
                     .send(CheckTask::Status(WorkDoneProgress::Begin(WorkDoneProgressBegin {
                         title: "Running 'cargo check'".to_string(),
@@ -243,6 +260,9 @@ impl CheckWatcherState {
             }
 
             CheckEvent::End => {
+                eprintln!(
+                    "[CheckWatcherState] Recieved end event, sending progress end notification"
+                );
                 task_send
                     .send(CheckTask::Status(WorkDoneProgress::End(WorkDoneProgressEnd {
                         message: None,
@@ -261,10 +281,17 @@ impl CheckWatcherState {
             }
 
             CheckEvent::Msg(Message::CompilerMessage(msg)) => {
+                eprintln!(
+                    "[CheckWatcherState] Recieved watch thread message, for package {:?}",
+                    msg.package_id
+                );
                 let map_result =
                     match map_rust_diagnostic_to_lsp(&msg.message, &self.workspace_root) {
                         Some(map_result) => map_result,
-                        None => return,
+                        None => {
+                            eprintln!("[CheckWatcherState] Couldn't map diagnostic, returning");
+                            return;
+                        }
                     };
 
                 let MappedRustDiagnostic { location, diagnostic, suggested_fixes } = map_result;
@@ -279,6 +306,7 @@ impl CheckWatcherState {
                 }
                 self.shared.write().add_diagnostic(file_uri, diagnostic);
 
+                eprintln!("[CheckWatcherState] Recieved watch thread message, requesting update of file diagnostics, file = {}", location.uri);
                 task_send.send(CheckTask::Update(location.uri)).unwrap();
             }
 
@@ -318,11 +346,13 @@ impl WatchThread {
             args.push("--all-targets".to_string());
         }
         args.extend(options.args.iter().cloned());
+        eprintln!("[WatchThread] Command and args: cargo {:?}", args);
 
         let (message_send, message_recv) = unbounded();
         let enabled = options.enable;
         let handle = std::thread::spawn(move || {
             if !enabled {
+                eprintln!("[WatchThread] Not enabled, returning");
                 return;
             }
 
@@ -335,6 +365,7 @@ impl WatchThread {
 
             // If we trigger an error here, we will do so in the loop instead,
             // which will break out of the loop, and continue the shutdown
+            eprintln!("[WatchThread] Sending begin event");
             let _ = message_send.send(CheckEvent::Begin);
 
             for message in cargo_metadata::parse_messages(command.stdout.take().unwrap()) {
@@ -346,6 +377,7 @@ impl WatchThread {
                     }
                 };
 
+                eprintln!("[WatchThread] Recieved message from cargo");
                 match message_send.send(CheckEvent::Msg(message)) {
                     Ok(()) => {}
                     Err(_err) => {
@@ -357,6 +389,7 @@ impl WatchThread {
 
             // We can ignore any error here, as we are already in the progress
             // of shutting down.
+            eprintln!("[WatchThread] Sending end event");
             let _ = message_send.send(CheckEvent::End);
 
             // It is okay to ignore the result, as it only errors if the process is already dead

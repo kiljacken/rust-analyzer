@@ -341,15 +341,20 @@ fn loop_turn(
                 // We manually send a diagnostic update when the watcher asks
                 // us to, to avoid the issue of having to change the file to
                 // receive updated diagnostics.
+                eprintln!("[loop_turn] Recieved update request for {}", uri);
                 let path = uri.to_file_path().map_err(|()| format!("invalid uri: {}", uri))?;
                 if let Some(file_id) = world_state.vfs.read().path2file(&path) {
+                    eprintln!("[loop_turn] File {} resolved to file_id {:?}", uri, file_id);
                     let params =
                         handlers::publish_diagnostics(&world_state.snapshot(), FileId(file_id.0))?;
                     let not = notification_new::<req::PublishDiagnostics>(params);
                     task_sender.send(Task::Notify(not)).unwrap();
+                } else {
+                    eprintln!("[loop_turn] File {} not resolved to file_id", uri);
                 }
             }
             CheckTask::Status(progress) => {
+                eprintln!("[loop_turn] Recieved progress notification, sending to client");
                 let params = req::ProgressParams {
                     token: req::ProgressToken::String("rustAnalyzer/cargoWatcher".to_string()),
                     value: req::ProgressParamsValue::WorkDone(progress),
