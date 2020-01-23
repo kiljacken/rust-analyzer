@@ -335,6 +335,7 @@ impl WatchThread {
             if !enabled {
                 return;
             }
+            log::info!("Invoking cargo with args: {:?}", args);
 
             let mut command = Command::new("cargo")
                 .args(&args)
