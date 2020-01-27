@@ -7,6 +7,7 @@ use lsp_types::{
     Diagnostic, Url, WorkDoneProgress, WorkDoneProgressBegin, WorkDoneProgressEnd,
     WorkDoneProgressReport,
 };
+use ra_prof::profile;
 use std::{
     collections::HashMap,
     path::PathBuf,
@@ -239,8 +240,10 @@ impl CheckWatcherThread {
     }
 
     fn handle_message(&self, msg: CheckEvent, task_send: &Sender<CheckTask>) {
+        let _p = profile("handle_check_event");
         match msg {
             CheckEvent::Begin => {
+                let _p = profile("send_begin");
                 task_send
                     .send(CheckTask::Status(WorkDoneProgress::Begin(WorkDoneProgressBegin {
                         title: "Running 'cargo check'".to_string(),
@@ -252,6 +255,7 @@ impl CheckWatcherThread {
             }
 
             CheckEvent::End => {
+                let _p = profile("send_end");
                 task_send
                     .send(CheckTask::Status(WorkDoneProgress::End(WorkDoneProgressEnd {
                         message: None,
@@ -260,6 +264,7 @@ impl CheckWatcherThread {
             }
 
             CheckEvent::Msg(Message::CompilerArtifact(msg)) => {
+                let _p = profile("send_progress");
                 task_send
                     .send(CheckTask::Status(WorkDoneProgress::Report(WorkDoneProgressReport {
                         cancellable: Some(false),
@@ -270,16 +275,21 @@ impl CheckWatcherThread {
             }
 
             CheckEvent::Msg(Message::CompilerMessage(msg)) => {
-                let map_result =
+                let map_result = {
+                    let _p = profile("map_diagnostic");
                     match map_rust_diagnostic_to_lsp(&msg.message, &self.workspace_root) {
                         Some(map_result) => map_result,
                         None => return,
-                    };
+                    }
+                };
 
                 let MappedRustDiagnostic { location, diagnostic, suggested_fixes } = map_result;
 
                 let diagnostic = DiagnosticWithFixes { diagnostic, suggested_fixes };
-                task_send.send(CheckTask::AddDiagnostic(location.uri, diagnostic)).unwrap();
+                {
+                    let _p = profile("send_diag_to_main");
+                    task_send.send(CheckTask::AddDiagnostic(location.uri, diagnostic)).unwrap();
+                }
             }
 
             CheckEvent::Msg(Message::BuildScriptExecuted(_msg)) => {}
@@ -332,10 +342,13 @@ impl WatchThread {
         let (message_send, message_recv) = unbounded();
         let enabled = options.enable;
         let handle = std::thread::spawn(move || {
+            let _p = profile("watch_process_thread");
             if !enabled {
+                log::info!("check watching disabled, not doing any work");
                 return;
             }
 
+            log::info!("launching cargo with args: {:?}", args);
             let mut command = Command::new("cargo")
                 .args(&args)
                 .stdout(Stdio::piped())
@@ -345,9 +358,20 @@ impl WatchThread {
 
             // If we trigger an error here, we will do so in the loop instead,
             // which will break out of the loop, and continue the shutdown
+            log::info!("sending start event");
             let _ = message_send.send(CheckEvent::Begin);
 
-            for message in cargo_metadata::parse_messages(command.stdout.take().unwrap()) {
+            let command_out = command.stdout.take().unwrap();
+            let mut stream = cargo_metadata::parse_messages(command_out).into_iter();
+            loop {
+                let message = {
+                    let _p = profile("wait_for_cargo");
+                    match stream.next() {
+                        Some(message) => message,
+                        None => break,
+                    }
+                };
+
                 let message = match message {
                     Ok(message) => message,
                     Err(err) => {
@@ -356,24 +380,37 @@ impl WatchThread {
                     }
                 };
 
-                match message_send.send(CheckEvent::Msg(message)) {
-                    Ok(()) => {}
-                    Err(_err) => {
-                        // The send channel was closed, so we want to shutdown
-                        break;
+                {
+                    let _p = profile("send_message_to_main");
+                    match message_send.send(CheckEvent::Msg(message)) {
+                        Ok(()) => {}
+                        Err(_err) => {
+                            // The send channel was closed, so we want to shutdown
+                            break;
+                        }
                     }
                 }
             }
 
             // We can ignore any error here, as we are already in the progress
             // of shutting down.
+            log::info!("sending end event");
             let _ = message_send.send(CheckEvent::End);
 
             // It is okay to ignore the result, as it only errors if the process is already dead
-            let _ = command.kill();
+            let _ = {
+                let _p = profile("kill_process");
+                command.kill()
+            };
 
             // Again, we don't care about the exit status so just ignore the result
-            let _ = command.wait();
+            log::info!("waiting for check to exit");
+            let _ = {
+                let _p = profile("wait_process");
+                command.wait()
+            };
+
+            log::info!("watch thread done");
         });
         WatchThread { handle: Some(handle), message_recv }
     }
